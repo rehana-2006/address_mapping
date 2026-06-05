@@ -2,6 +2,7 @@ import httpx
 import hashlib
 import math
 import random
+import time
 from typing import List, Dict, Any, Optional, Tuple
 from config import OLA_MAPS_API_KEY, OLA_MAPS_BASE_URL
 
@@ -35,22 +36,41 @@ class OlaMapsClient:
                 "X-Request-Id": f"geo-{hashlib.md5(address_clean.encode()).hexdigest()[:8]}"
             }
             
-            response = httpx.get(url, params=params, headers=headers, timeout=10.0)
-            if response.status_code == 200:
-                data = response.json()
-                results = data.get("geocodingResults", [])
-                if results:
-                    location = results[0].get("geometry", {}).get("location", {})
-                    lat = location.get("lat")
-                    lng = location.get("lng")
-                    if lat is not None and lng is not None:
-                        return float(lat), float(lng)
             
-            print(f"Ola Maps Geocoding failed (Status {response.status_code}). Falling back to mock geocoder.")
-            return self._mock_geocode(address_clean)
+            for attempt in range(3):
+                try:
+                    response = httpx.get(url, params=params, headers=headers, timeout=10.0)
+                    if response.status_code == 200:
+                        data = response.json()
+                        results = data.get("geocodingResults", [])
+                        if results:
+                            location = results[0].get("geometry", {}).get("location", {})
+                            lat = location.get("lat")
+                            lng = location.get("lng")
+                            if lat is not None and lng is not None:
+                                return float(lat), float(lng)
+                        break
+                    elif response.status_code in [429, 500, 502, 503, 504]:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    else:
+                        break
+                except httpx.RequestError:
+                    if attempt < 2:
+                        time.sleep(2 * (attempt + 1))
+                        continue
+                    else:
+                        break
+                        
+            print(f"Ola Maps Geocoding failed.")
+            if self.is_mock:
+                return self._mock_geocode(address_clean)
+            return None
         except Exception as e:
-            print(f"Ola Maps Geocoding Exception: {e}. Falling back to mock geocoder.")
-            return self._mock_geocode(address_clean)
+            print(f"Ola Maps Geocoding Exception: {e}.")
+            if self.is_mock:
+                return self._mock_geocode(address_clean)
+            return None
 
     def get_distance_matrix(self, origins: List[Tuple[str, float, float]], destinations: List[Tuple[str, float, float]]) -> List[Dict[str, Any]]:
         """
@@ -69,72 +89,117 @@ class OlaMapsClient:
         # Ola Maps Distance Matrix format: origins=lat,lng|lat,lng&destinations=lat,lng|lat,lng
         results = []
         
-        # To avoid exceeding URL length or API limits, we chunk destinations in groups of 10
-        dest_chunk_size = 10
-        for i in range(0, len(destinations), dest_chunk_size):
-            dest_chunk = destinations[i:i + dest_chunk_size]
-            
-            # Format origins: "lat,lng|lat,lng"
-            origins_param = "|".join([f"{lat},{lng}" for _, lat, lng in origins])
-            destinations_param = "|".join([f"{lat},{lng}" for _, lat, lng in dest_chunk])
-            
-            try:
-                url = f"{self.base_url}/routing/v1/distanceMatrix"
-                params = {
-                    "origins": origins_param,
-                    "destinations": destinations_param,
-                    "api_key": self.api_key
-                }
-                headers = {
-                    "X-Request-Id": f"dist-{random.randint(1000, 9999)}"
-                }
+        # To avoid exceeding URL length or API limits, we chunk both origins and destinations
+        orig_chunk_size = 5
+        dest_chunk_size = 5
+        for o_i in range(0, len(origins), orig_chunk_size):
+            orig_chunk = origins[o_i:o_i + orig_chunk_size]
+            for i in range(0, len(destinations), dest_chunk_size):
+                dest_chunk = destinations[i:i + dest_chunk_size]
                 
-                response = httpx.get(url, params=params, headers=headers, timeout=15.0)
-                if response.status_code == 200:
-                    data = response.json()
-                    # The response typically has: { "rows": [ { "elements": [ { "distance": 123, "duration": 456 } ] } ] }
-                    rows = data.get("rows", [])
+                # Format origins: "lat,lng|lat,lng"
+                origins_param = "|".join([f"{lat},{lng}" for _, lat, lng in orig_chunk])
+                destinations_param = "|".join([f"{lat},{lng}" for _, lat, lng in dest_chunk])
+                
+                try:
+                    url = f"{self.base_url}/routing/v1/distanceMatrix"
+                    params = {
+                        "origins": origins_param,
+                        "destinations": destinations_param,
+                        "api_key": self.api_key
+                    }
+                    headers = {
+                        "X-Request-Id": f"dist-{random.randint(1000, 9999)}"
+                    }
                     
-                    for o_idx, origin in enumerate(origins):
-                        v_id = origin[0]
-                        if o_idx >= len(rows):
-                            continue
-                            
-                        elements = rows[o_idx].get("elements", [])
-                        for d_idx, dest in enumerate(dest_chunk):
-                            s_id = dest[0]
-                            if d_idx >= len(elements):
+                    for attempt in range(3):
+                        try:
+                            response = httpx.get(url, params=params, headers=headers, timeout=20.0)
+                            if response.status_code == 200:
+                                break
+                            elif response.status_code in [429, 500, 502, 503, 504]:
+                                time.sleep(2 * (attempt + 1))
+                                continue
+                            else:
+                                break
+                        except httpx.RequestError:
+                            if attempt < 2:
+                                time.sleep(2 * (attempt + 1))
+                                continue
+                            else:
+                                raise
+                                
+                    if response.status_code == 200:
+                        data = response.json()
+                        # The response typically has: { "rows": [ { "elements": [ { "distance": 123, "duration": 456 } ] } ] }
+                        rows = data.get("rows", [])
+                        
+                        for o_idx, origin in enumerate(orig_chunk):
+                            v_id = origin[0]
+                            # If API dropped this row
+                            if o_idx >= len(rows):
+                                if self.is_mock:
+                                    mock_res = self._mock_distance_matrix([origin], dest_chunk)
+                                    results.extend(mock_res)
+                                else:
+                                    raise Exception(f"Ola Maps API returned incomplete rows. Dropped origin {origin[0]}.")
                                 continue
                                 
-                            element = elements[d_idx]
-                            
-                            # distance in meters -> convert to km
-                            dist_meters = element.get("distance", 0)
-                            dist_km = round(float(dist_meters) / 1000.0, 2)
-                            
-                            # duration in seconds -> convert to minutes
-                            dur_seconds = element.get("duration", 0)
-                            dur_mins = round(float(dur_seconds) / 60.0, 1)
-                            
-                            # If API returns an error or status was invalid for this element
-                            if dist_meters == 0 and dur_seconds == 0:
-                                # Fall back to mock distance for this specific element
-                                mock_val = self._calculate_haversine_road(origin[1], origin[2], dest[1], dest[2])
-                                dist_km = mock_val["distance_km"]
-                                dur_mins = mock_val["duration_minutes"]
+                            elements = rows[o_idx].get("elements", [])
+                            for d_idx, dest in enumerate(dest_chunk):
+                                s_id = dest[0]
+                                # If API dropped this element
+                                if d_idx >= len(elements):
+                                    if self.is_mock:
+                                        mock_val = self._calculate_haversine_road(origin[1], origin[2], dest[1], dest[2])
+                                        results.append({
+                                            "volunteer_id": v_id,
+                                            "student_id": s_id,
+                                            "distance_km": mock_val["distance_km"],
+                                            "duration_minutes": mock_val["duration_minutes"]
+                                        })
+                                    else:
+                                        raise Exception(f"Ola Maps API returned incomplete elements. Dropped destination {s_id}. API Response: {data}")
+                                    continue
+                                    
+                                element = elements[d_idx]
+                                
+                                # distance in meters -> convert to km
+                                dist_meters = element.get("distance", 0)
+                                dist_km = round(float(dist_meters) / 1000.0, 2)
+                                
+                                # duration in seconds -> convert to minutes
+                                dur_seconds = element.get("duration", 0)
+                                dur_mins = round(float(dur_seconds) / 60.0, 1)
+                                
+                                # If API returns an error or status was invalid for this element
+                                if dist_meters == 0 and dur_seconds == 0:
+                                    if self.is_mock:
+                                        mock_val = self._calculate_haversine_road(origin[1], origin[2], dest[1], dest[2])
+                                        dist_km = mock_val["distance_km"]
+                                        dur_mins = mock_val["duration_minutes"]
+                                    else:
+                                        # Leave as 0 to reflect the exact output from the API
+                                        pass
 
-                            results.append({
-                                "volunteer_id": v_id,
-                                "student_id": s_id,
-                                "distance_km": dist_km,
-                                "duration_minutes": dur_mins
-                            })
-                else:
-                    print(f"Ola Maps Distance Matrix failed (Status {response.status_code}). Using mock distances.")
-                    results.extend(self._mock_distance_matrix(origins, dest_chunk))
-            except Exception as e:
-                print(f"Ola Maps Distance Matrix Exception: {e}. Using mock distances.")
-                results.extend(self._mock_distance_matrix(origins, dest_chunk))
+                                results.append({
+                                    "volunteer_id": v_id,
+                                    "student_id": s_id,
+                                    "distance_km": dist_km,
+                                    "duration_minutes": dur_mins
+                                })
+                    else:
+                        if self.is_mock:
+                            print(f"Ola Maps Distance Matrix failed (Status {response.status_code}). Using mock distances.")
+                            results.extend(self._mock_distance_matrix(orig_chunk, dest_chunk))
+                        else:
+                            raise Exception(f"Ola Maps Distance Matrix failed (Status {response.status_code}): {response.text}")
+                except Exception as e:
+                    if self.is_mock:
+                        print(f"Ola Maps Distance Matrix Exception: {e}. Using mock distances.")
+                        results.extend(self._mock_distance_matrix(orig_chunk, dest_chunk))
+                    else:
+                        raise e
                 
         return results
 

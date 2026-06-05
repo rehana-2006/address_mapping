@@ -312,8 +312,9 @@ async def calculate_distances():
         # To avoid making N*M single HTTP requests, we query unique origins and their corresponding destinations.
         # Since Ola Maps can take a list of origins and destinations:
         # We can query all unique volunteers and destinations in batches.
-        unique_origins = list({p[0] for p in missing_pairings})
-        unique_destinations = list({p[1] for p in missing_pairings})
+        # Preserve order using dict.fromkeys (deterministic in Python 3.7+)
+        unique_origins = list(dict.fromkeys(p[0] for p in missing_pairings))
+        unique_destinations = list(dict.fromkeys(p[1] for p in missing_pairings))
         
         # Call API
         api_results = ola_client.get_distance_matrix(unique_origins, unique_destinations)

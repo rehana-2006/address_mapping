@@ -1,5 +1,8 @@
 from typing import List, Dict, Any
 
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+
 class MatchingService:
     @staticmethod
     def generate_assignments(
@@ -13,9 +16,9 @@ class MatchingService:
         Assigns each volunteer to the nearest students based on road distance.
         
         Rules:
-        - Sort by shortest road distance.
         - Configurable max students per volunteer.
         - Configurable duplicate prevention (each student assigned to at most one volunteer).
+        - Uses Hungarian algorithm for globally optimal assignment to minimize total distance.
         
         Returns:
         List of assignments, where each assignment is a dict containing volunteer and student details.
@@ -66,64 +69,51 @@ class MatchingService:
                             "duration_minutes": dur
                         })
         else:
-            # Prevent duplicate assignments.
-            # We use a balanced greedy round-robin algorithm:
-            # Round 1: Assign each volunteer their closest unassigned student
-            # Round 2: Assign each volunteer who has < max_students their next closest unassigned student
-            # ... and so on, until all volunteers have max_students, or no students are left.
+            # Prevent duplicate assignments using Hungarian Algorithm (Global Minimum Distance)
+            num_volunteers = len(volunteers)
+            num_students = len(students)
             
-            assigned_students = set()
-            vol_assignments = {str(v["id"]): [] for v in volunteers}
-            
-            for round_num in range(max_students):
-                # In each round, we iterate through volunteers and let them choose their closest available student
-                for v in volunteers:
-                    v_id = str(v["id"])
+            # Each volunteer has `max_students` slots.
+            # We map each slot to the original volunteer.
+            slots = []
+            for v in volunteers:
+                for _ in range(max_students):
+                    slots.append(v)
                     
-                    # Find closest available student
-                    best_student = None
-                    best_dist = 99999.0
-                    best_dur = 99999.0
-                    
-                    for s in students:
-                        s_id = str(s["id"])
-                        if s_id in assigned_students:
-                            continue
-                            
-                        cache_key = f"{v_id}:{s_id}"
-                        if cache_key in distance_matrix:
-                            dist = distance_matrix[cache_key]["distance_km"]
-                            dur = distance_matrix[cache_key]["duration_minutes"]
-                        else:
-                            dist = 99999.0
-                            dur = 99999.0
-                            
-                        if dist < best_dist:
-                            best_dist = dist
-                            best_dur = dur
-                            best_student = s_id
-                            
-                    # If we found an available student, assign them
-                    if best_student and best_dist < 99999.0:
-                        assigned_students.add(best_student)
-                        vol_assignments[v_id].append({
-                            "student_id": best_student,
-                            "distance_km": best_dist,
-                            "duration_minutes": best_dur
-                        })
+            num_slots = len(slots)
             
-            # Format output
-            for v_id, matches in vol_assignments.items():
-                v = vol_lookup[v_id]
-                for match in matches:
-                    s = stud_lookup[match["student_id"]]
+            # Create Cost Matrix (rows = slots, cols = students)
+            # We initialize with a high cost (99999.0)
+            cost_matrix = np.full((num_slots, num_students), 99999.0)
+            dur_matrix = np.full((num_slots, num_students), 99999.0)
+            
+            for i, slot_v in enumerate(slots):
+                v_id = str(slot_v["id"])
+                for j, s in enumerate(students):
+                    s_id = str(s["id"])
+                    cache_key = f"{v_id}:{s_id}"
+                    if cache_key in distance_matrix:
+                        cost_matrix[i, j] = distance_matrix[cache_key]["distance_km"]
+                        dur_matrix[i, j] = distance_matrix[cache_key]["duration_minutes"]
+                        
+            # Run linear_sum_assignment (Hungarian algorithm)
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            
+            for r, c in zip(row_ind, col_ind):
+                dist = cost_matrix[r, c]
+                # Only assign if distance is valid (< 99999.0)
+                if dist < 99999.0:
+                    v = slots[r]
+                    s = students[c]
+                    dur = dur_matrix[r, c]
+                    
                     assignments.append({
-                        "volunteer_id": v_id,
+                        "volunteer_id": str(v["id"]),
                         "volunteer_name": v["name"],
-                        "student_id": match["student_id"],
+                        "student_id": str(s["id"]),
                         "student_name": s["name"],
-                        "distance_km": match["distance_km"],
-                        "duration_minutes": match["duration_minutes"]
+                        "distance_km": dist,
+                        "duration_minutes": dur
                     })
                     
         return assignments
